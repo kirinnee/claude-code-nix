@@ -59,16 +59,16 @@ stdenv.mkDerivation rec {
   buildPhase = ''
     runHook preBuild
     mkdir -p build
-    cp ${nativeBinary} build/claude-raw
-    chmod u+w,+x build/claude-raw
+    cp ${nativeBinary} build/.claude-unwrapped
+    chmod u+w,+x build/.claude-unwrapped
 
     ${lib.optionalString stdenv.isLinux ''
     # Patch only the interpreter for NixOS compatibility
     # Do NOT use --set-rpath as it corrupts the Bun embedded payload
-    patchelf --set-interpreter "$(cat ${stdenv.cc}/nix-support/dynamic-linker)" build/claude-raw
+    patchelf --set-interpreter "$(cat ${stdenv.cc}/nix-support/dynamic-linker)" build/.claude-unwrapped
 
     # Verify the Bun trailer is still intact
-    if ! tail -c 20 build/claude-raw | grep -q "Bun!"; then
+    if ! tail -c 20 build/.claude-unwrapped | grep -q "Bun!"; then
       echo "ERROR: Bun trailer was corrupted by patchelf!"
       exit 1
     fi
@@ -81,22 +81,22 @@ stdenv.mkDerivation rec {
     runHook preInstall
     mkdir -p $out/bin
 
-    # Install the patched binary
-    cp build/claude-raw $out/bin/claude-raw
-    chmod +x $out/bin/claude-raw
+    # Install the patched binary as a hidden unwrapped name
+    cp build/.claude-unwrapped $out/bin/.claude-unwrapped
+    chmod +x $out/bin/.claude-unwrapped
 
-    # Create wrapper script with model-based env var mapping
-    cat > $out/bin/claude << 'EOF'
+    # Create claude-raw wrapper that intercepts --model flag and applies env injection.
+    # Claude Code spawns claude-raw for sub-agents, so interception must happen here.
+    cat > $out/bin/claude-raw << 'EOF'
 #!@bash@/bin/bash
 set -o pipefail
 
-# Path to the raw binary
-CLAUDE_RAW="@out@/bin/claude-raw"
+CLAUDE_UNWRAPPED="@out@/bin/.claude-unwrapped"
 export CLAUDE_EXECUTABLE_PATH="$HOME/.local/bin/claude"
 export DISABLE_AUTOUPDATER=1
 export DISABLE_INSTALLATION_CHECKS=1
 
-# Extract model from arguments, building filtered args list
+# Extract --model from arguments and strip it
 MODEL=""
 FILTERED_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -116,49 +116,34 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Function to load and apply model environment mapping
-apply_model_env() {
-    local model="$1"
-    local mapping_file=""
-    local jq="@jq@/bin/jq"
-
-    # Check current directory first, then home directory
-    if [[ -f "model-mapping.json" ]]; then
-        mapping_file="$(pwd)/model-mapping.json"
-    elif [[ -f "$HOME/.claude/model-mapping.json" ]]; then
-        mapping_file="$HOME/.claude/model-mapping.json"
-    else
-        return 0
-    fi
-
-    # Check if model exists in mapping
-    if ! "$jq" -e ".\"$model\"" "$mapping_file" >/dev/null 2>&1; then
-        return 0
-    fi
-
-    # Extract env vars for the model
-    local env_vars
-    env_vars=$("$jq" -r ".\"$model\" | to_entries | .[] | \"\(.key)=\(.value)\"" "$mapping_file" 2>/dev/null) || return 0
-
-    # Export each env var with expansion (properly quoted)
-    while IFS='=' read -r key value; do
-        [[ -n "$key" ]] && eval "export $key=\"$value\""
-    done <<< "$env_vars"
-}
-
-# Apply model-based environment if model was specified
+# Apply model-based environment if a model was specified
 if [[ -n "$MODEL" ]]; then
-    apply_model_env "$MODEL"
+    JQ="@jq@/bin/jq"
+    MAPPING_FILE=""
+
+    if [[ -f "model-mapping.json" ]]; then
+        MAPPING_FILE="$(pwd)/model-mapping.json"
+    elif [[ -f "$HOME/.claude/model-mapping.json" ]]; then
+        MAPPING_FILE="$HOME/.claude/model-mapping.json"
+    fi
+
+    if [[ -n "$MAPPING_FILE" ]] && "$JQ" -e ".\"$MODEL\"" "$MAPPING_FILE" >/dev/null 2>&1; then
+        while IFS='=' read -r key value; do
+            [[ -n "$key" ]] && eval "export $key=\"$value\""
+        done < <("$JQ" -r ".\"$MODEL\" | to_entries | .[] | \"\(.key)=\(.value)\"" "$MAPPING_FILE" 2>/dev/null)
+    fi
 fi
 
-# Execute the raw binary with filtered arguments (without --model)
-exec "$CLAUDE_RAW" "''${FILTERED_ARGS[@]}"
+exec "$CLAUDE_UNWRAPPED" "''${FILTERED_ARGS[@]}"
 EOF
-    chmod +x $out/bin/claude
-    substituteInPlace $out/bin/claude \
+    chmod +x $out/bin/claude-raw
+    substituteInPlace $out/bin/claude-raw \
         --replace-fail '@bash@' '${bash}' \
         --replace-fail '@out@' "$out" \
         --replace-fail '@jq@' '${jq}'
+
+    # claude is a symlink to claude-raw (same --model handling)
+    ln -s claude-raw $out/bin/claude
     runHook postInstall
   '';
 
